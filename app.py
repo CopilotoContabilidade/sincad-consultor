@@ -76,7 +76,7 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
             if not cnpj_fn:
                 ti = [i for i in form.find_all('input') if i.get('type','text').lower() in ('text','')]
                 if ti: cnpj_fn = ti[0].get('name') or ti[0].get('id')
-            if cnpj_fn: post[cnpj_fn] = cnpj
+            if cnpj_fn: post[cnpj_fn] = fmt_cnpj(cnpj)
 
             # CAPTCHA image
             cap_img = next((i for i in soup.find_all('img')
@@ -116,7 +116,7 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
             rs = BeautifulSoup(pr.text, 'html.parser')
             bt = rs.get_text().lower()
 
-            if any(x in bt for x in ['captcha inválido','código inválido','invalid captcha']):
+            if any(x in bt for x in ['captcha inválido','código inválido','invalid captcha','incorreto','obrigatório','tente novamente','informe o código']):
                 continue  # CAPTCHA errado, tenta de novo
             if 'não há registros' in bt or 'nenhum registro' in bt:
                 return {'condicao':'Sem registros','ie_encontrada':''}
