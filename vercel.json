@@ -1,0 +1,5 @@
+{
+  "builds": [{"src": "app.py", "use": "@vercel/python"}],
+  "routes": [{"src": "/(.*)", "dest": "app.py"}],
+  "env": {"ANTHROPIC_API_KEY": "@anthropic-api-key"}
+}
