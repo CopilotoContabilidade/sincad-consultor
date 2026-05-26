@@ -170,6 +170,22 @@ def gerar_excel(empresas):
     return buf
 
 # ── Rotas ───────────────────────────────────────────────────────────────────
+@app.route('/api/debug', methods=['POST'])
+def api_debug():
+    data = request.get_json() or {}
+    cnpj = limpar_cnpj(data.get('cnpj', '25316180000146'))
+    sess = req.Session()
+    sess.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    sess.headers['Accept-Language'] = 'pt-BR,pt;q=0.9'
+    r = sess.get(SINCAD_URL, timeout=15)
+    soup = BeautifulSoup(r.text, 'html.parser')
+    form = soup.find('form')
+    inputs = [{'id': i.get('id',''), 'name': i.get('name',''), 'type': i.get('type',''), 'value': i.get('value','')[:30]} for i in form.find_all('input')] if form else []
+    cap_img = next((i for i in soup.find_all('img') if 'botdetect' in i.get('src','').lower() or 'get=image' in i.get('src','').lower()), None)
+    cap_src = (SINCAD_BASE + cap_img['src'] if cap_img and cap_img['src'].startswith('/') else cap_img['src']) if cap_img else None
+    cap_bytes = sess.get(cap_src, timeout=10).content if cap_src else None
+    cap_code = resolver_captcha(cap_bytes) if cap_bytes else 'sem imagem'
+    return jsonify({'inputs': inputs, 'captcha_lido': cap_code, 'cap_src': cap_src, 'form_action': form.get('action','') if form else ''})
 @app.route('/')
 def index(): return HTML
 
