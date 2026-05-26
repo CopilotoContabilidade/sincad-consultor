@@ -21,7 +21,7 @@ def resolver_captcha(img_bytes):
     img.save(buf, format='PNG')
     img_b64 = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
 
-    client = anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY'))
+    client = anthropic.Anthropic()
     msg = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=20,
