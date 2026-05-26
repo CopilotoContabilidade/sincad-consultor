@@ -10,17 +10,22 @@ from PIL import Image, ImageEnhance
 
 app = Flask(__name__)
 
-# ── CAPTCHA via Claude Vision ───────────────────────────────────────────────
+SINCAD_URL  = "https://sucief-sincad-web.fazenda.rj.gov.br/sincad-web/index.jsf"
+SINCAD_BASE = "https://sucief-sincad-web.fazenda.rj.gov.br"
+
+def limpar_cnpj(v): return ''.join(filter(str.isdigit, str(v)))
+def fmt_cnpj(v):
+    c = limpar_cnpj(v).zfill(14)
+    return f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}"
+
 def resolver_captcha(img_bytes):
-    """Usa Claude Haiku para ler o CAPTCHA — mais preciso que qualquer OCR local"""
-    # Pré-processamento leve para melhorar legibilidade
     img = Image.open(io.BytesIO(img_bytes)).convert('L')
     img = ImageEnhance.Contrast(img).enhance(2.5)
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
     img = img.convert('RGB')
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     img_b64 = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
-
     client = anthropic.Anthropic()
     msg = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -35,66 +40,73 @@ def resolver_captcha(img_bytes):
     )
     return msg.content[0].text.strip()
 
-# ── Scraper SINCAD ─────────────────────────────────────────────────────────
-SINCAD_URL  = "https://sucief-sincad-web.fazenda.rj.gov.br/sincad-web/index.jsf"
-SINCAD_BASE = "https://sucief-sincad-web.fazenda.rj.gov.br"
-
-def limpar_cnpj(v): return ''.join(filter(str.isdigit, str(v)))
-def fmt_cnpj(v):
-    c = limpar_cnpj(v).zfill(14)
-    return f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}"
-
 def consultar_cnpj(cnpj_raw, max_tent=4):
-    cnpj = limpar_cnpj(cnpj_raw)
+    cnpj_digits = limpar_cnpj(cnpj_raw)
+    cnpj_fmt    = fmt_cnpj(cnpj_raw)
+    debug_log   = []
+
     for t in range(1, max_tent + 1):
         sess = req.Session()
         sess.headers['User-Agent'] = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                                       'AppleWebKit/537.36 Chrome/120.0 Safari/537.36')
         sess.headers['Accept-Language'] = 'pt-BR,pt;q=0.9'
+        sess.headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
         try:
             r = sess.get(SINCAD_URL, timeout=15)
             soup = BeautifulSoup(r.text, 'html.parser')
             form = soup.find('form')
-            if not form: raise Exception("form não encontrado")
+            if not form:
+                debug_log.append(f't{t}: form não encontrado')
+                continue
+
             action = form.get('action', SINCAD_URL)
             if action.startswith('/'): action = SINCAD_BASE + action
 
-            # Coletar campos hidden (ViewState JSF etc.)
+            # Coletar todos os campos
             post = {}
             for inp in form.find_all('input'):
-                tp = inp.get('type','text').lower()
-                n, v = inp.get('name',''), inp.get('value','')
-                if n and tp not in ('submit','button','image','reset'): post[n] = v
+                tp = inp.get('type', 'text').lower()
+                n, v = inp.get('name', ''), inp.get('value', '')
+                if n and tp not in ('submit', 'button', 'image', 'reset'):
+                    post[n] = v
 
-            # Campo CNPJ
+            # Identificar campo CNPJ
             cnpj_fn = None
             for inp in form.find_all('input'):
                 fid = (inp.get('id') or '').lower()
                 fn  = (inp.get('name') or '').lower()
                 if 'cnpj' in fid or 'cnpj' in fn:
-                    cnpj_fn = inp.get('name') or inp.get('id'); break
+                    cnpj_fn = inp.get('name') or inp.get('id')
+                    break
             if not cnpj_fn:
-                ti = [i for i in form.find_all('input') if i.get('type','text').lower() in ('text','')]
+                ti = [i for i in form.find_all('input') if i.get('type', 'text').lower() in ('text', '')]
                 if ti: cnpj_fn = ti[0].get('name') or ti[0].get('id')
-            if cnpj_fn: post[cnpj_fn] = fmt_cnpj(cnpj)
 
-            # CAPTCHA image
+            # Tenta com formato e sem formato
+            post[cnpj_fn] = cnpj_fmt if cnpj_fn else cnpj_digits
+            debug_log.append(f't{t}: cnpj_fn={cnpj_fn}, valor={post.get(cnpj_fn)}')
+
+            # CAPTCHA imagem
             cap_img = next((i for i in soup.find_all('img')
-                if 'botdetect' in i.get('src','').lower()
-                or ('captcha' in i.get('src','').lower() and 'image' in i.get('src','').lower())
-                or 'get=image' in i.get('src','').lower()), None)
-            if not cap_img: raise Exception("imagem CAPTCHA não encontrada")
+                if 'botdetect' in i.get('src', '').lower()
+                or 'get=image' in i.get('src', '').lower()
+                or ('captcha' in i.get('src', '').lower() and 'image' in i.get('src', '').lower())), None)
+            if not cap_img:
+                debug_log.append(f't{t}: imagem captcha não encontrada')
+                continue
+
             cap_src = cap_img['src']
             if cap_src.startswith('/'): cap_src = SINCAD_BASE + cap_src
             cap_r = sess.get(cap_src, timeout=10)
             code = resolver_captcha(cap_r.content)
+            debug_log.append(f't{t}: captcha lido={code}')
 
-            # Campo do código CAPTCHA
+            # Identificar campo captcha
             cap_fn = None
             for inp in form.find_all('input'):
                 fid = (inp.get('id') or '').lower()
                 fn  = (inp.get('name') or '').lower()
-                fcl = ' '.join(inp.get('class',[])).lower()
+                fcl = ' '.join(inp.get('class', [])).lower()
                 nm  = inp.get('name') or inp.get('id')
                 if nm and nm != cnpj_fn and (
                     'captcha' in fid or 'captcha' in fn or
@@ -102,24 +114,31 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                 ):
                     cap_fn = nm; break
             if not cap_fn:
-                ti = [i for i in form.find_all('input') if i.get('type','text').lower() in ('text','')]
+                ti = [i for i in form.find_all('input') if i.get('type', 'text').lower() in ('text', '')]
                 for i in reversed(ti):
                     nm = i.get('name') or i.get('id')
                     if nm and nm != cnpj_fn: cap_fn = nm; break
             if cap_fn: post[cap_fn] = code
+            debug_log.append(f't{t}: cap_fn={cap_fn}')
 
             # Submit
-            sub = form.find('input',{'type':'submit'}) or form.find('button',{'type':'submit'})
-            if sub and sub.get('name'): post[sub['name']] = sub.get('value','Pesquisar')
+            sub = form.find('input', {'type': 'submit'}) or form.find('button', {'type': 'submit'})
+            if sub and sub.get('name'): post[sub['name']] = sub.get('value', 'Pesquisar')
 
             pr = sess.post(action, data=post, timeout=15)
             rs = BeautifulSoup(pr.text, 'html.parser')
             bt = rs.get_text().lower()
+            debug_log.append(f't{t}: resposta[:300]={bt[:300]}')
 
-            if any(x in bt for x in ['captcha inválido','código inválido','invalid captcha','incorreto','obrigatório','tente novamente','informe o código']):
-                continue  # CAPTCHA errado, tenta de novo
-            if 'não há registros' in bt or 'nenhum registro' in bt:
-                return {'condicao':'Sem registros','ie_encontrada':''}
+            erros_captcha = ['captcha inválido', 'código inválido', 'invalid captcha',
+                             'captcha incorreto', 'código incorreto', 'tente novamente',
+                             'informe o código', 'campo obrigatório']
+            if any(x in bt for x in erros_captcha):
+                debug_log.append(f't{t}: captcha rejeitado')
+                continue
+
+            if 'não há registros' in bt or 'nenhum registro' in bt or 'sem registros' in bt:
+                return {'condicao': 'Sem registros', 'ie_encontrada': '', 'debug': debug_log}
 
             conds, ies = [], []
             for table in rs.find_all('table'):
@@ -130,76 +149,98 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                     if len(cells) >= 5: ies.append(cells[3]); conds.append(cells[4])
                     elif len(cells) >= 2 and cells[-1]: conds.append(cells[-1])
             if conds:
-                return {'condicao':' | '.join(filter(None,conds)),
-                        'ie_encontrada':' | '.join(filter(None,ies))}
-            if t == max_tent:
-                return {'condicao':'Resultado não reconhecido','ie_encontrada':''}
-        except Exception as e:
-            if t == max_tent:
-                return {'condicao':f'Erro: {str(e)[:80]}','ie_encontrada':''}
-            time.sleep(1)
-    return {'condicao':'Falha','ie_encontrada':''}
+                return {'condicao': ' | '.join(filter(None, conds)),
+                        'ie_encontrada': ' | '.join(filter(None, ies)),
+                        'debug': debug_log}
 
-# ── Excel ───────────────────────────────────────────────────────────────────
+            if t == max_tent:
+                return {'condicao': 'Resultado não reconhecido', 'ie_encontrada': '', 'debug': debug_log}
+
+        except Exception as e:
+            debug_log.append(f't{t}: exceção={str(e)[:100]}')
+            if t == max_tent:
+                return {'condicao': f'Erro: {str(e)[:80]}', 'ie_encontrada': '', 'debug': debug_log}
+            time.sleep(1)
+
+    return {'condicao': 'Falha', 'ie_encontrada': '', 'debug': debug_log}
+
 def gerar_excel(empresas):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "SINCAD"
-    headers = ['Nome','CNPJ','IE (entrada)','IE (SINCAD)','Situação','Consultado em']
+    headers = ['Nome', 'CNPJ', 'IE (entrada)', 'IE (SINCAD)', 'Situação', 'Consultado em']
     widths  = [45, 22, 22, 22, 38, 22]
     hf = PatternFill("solid", fgColor="472D54")
     ht = Font(bold=True, color="FFFFFF")
-    for col,(h,w) in enumerate(zip(headers,widths),1):
-        c = ws.cell(row=1,column=col,value=h)
-        c.fill=hf; c.font=ht; c.alignment=Alignment(horizontal='center')
+    for col, (h, w) in enumerate(zip(headers, widths), 1):
+        c = ws.cell(row=1, column=col, value=h)
+        c.fill = hf; c.font = ht; c.alignment = Alignment(horizontal='center')
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = w
     ws.row_dimensions[1].height = 22
-    CV=PatternFill("solid",fgColor="C6EFCE"); CR=PatternFill("solid",fgColor="FFC7CE")
-    CA=PatternFill("solid",fgColor="FFEB9C"); CC=PatternFill("solid",fgColor="EEEEEE")
+    CV = PatternFill("solid", fgColor="C6EFCE"); CR = PatternFill("solid", fgColor="FFC7CE")
+    CA = PatternFill("solid", fgColor="FFEB9C"); CC = PatternFill("solid", fgColor="EEEEEE")
     now = datetime.now().strftime('%d/%m/%Y %H:%M')
-    for i,e in enumerate(empresas,2):
-        cl = e.get('condicao','').lower()
-        if any(p in cl for p in ['habilitad','ativa','regular']): fill=CV
-        elif any(p in cl for p in ['baix','cancel','inapt','irregular']): fill=CR
-        elif any(p in cl for p in ['suspens','sem registro']): fill=CA
-        else: fill=CC
-        vals=[e.get('nome',''),fmt_cnpj(e.get('cnpj','')),
-              e.get('ie',''),e.get('ie_encontrada',''),e.get('condicao',''),now]
-        for col,val in enumerate(vals,1):
-            ws.cell(row=i,column=col,value=val).fill=fill
-    ws.freeze_panes='A2'
-    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+    for i, e in enumerate(empresas, 2):
+        cl = e.get('condicao', '').lower()
+        if any(p in cl for p in ['habilitad', 'ativa', 'regular']): fill = CV
+        elif any(p in cl for p in ['baix', 'cancel', 'inapt', 'irregular']): fill = CR
+        elif any(p in cl for p in ['suspens', 'sem registro']): fill = CA
+        else: fill = CC
+        vals = [e.get('nome', ''), fmt_cnpj(e.get('cnpj', '')),
+                e.get('ie', ''), e.get('ie_encontrada', ''), e.get('condicao', ''), now]
+        for col, val in enumerate(vals, 1):
+            ws.cell(row=i, column=col, value=val).fill = fill
+    ws.freeze_panes = 'A2'
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf
 
-# ── Rotas ───────────────────────────────────────────────────────────────────
-@app.route('/api/debug', methods=['POST'])
-def api_debug():
-    data = request.get_json() or {}
-    cnpj = limpar_cnpj(data.get('cnpj', '25316180000146'))
-    sess = req.Session()
-    sess.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    sess.headers['Accept-Language'] = 'pt-BR,pt;q=0.9'
-    r = sess.get(SINCAD_URL, timeout=15)
-    soup = BeautifulSoup(r.text, 'html.parser')
-    form = soup.find('form')
-    inputs = [{'id': i.get('id',''), 'name': i.get('name',''), 'type': i.get('type',''), 'value': i.get('value','')[:30]} for i in form.find_all('input')] if form else []
-    cap_img = next((i for i in soup.find_all('img') if 'botdetect' in i.get('src','').lower() or 'get=image' in i.get('src','').lower()), None)
-    cap_src = (SINCAD_BASE + cap_img['src'] if cap_img and cap_img['src'].startswith('/') else cap_img['src']) if cap_img else None
-    cap_bytes = sess.get(cap_src, timeout=10).content if cap_src else None
-    cap_code = resolver_captcha(cap_bytes) if cap_bytes else 'sem imagem'
-    return jsonify({'inputs': inputs, 'captcha_lido': cap_code, 'cap_src': cap_src, 'form_action': form.get('action','') if form else ''})
 @app.route('/')
 def index(): return HTML
+
+@app.route('/api/debug', methods=['GET', 'POST'])
+def api_debug():
+    """Diagnóstico: mostra campos do formulário e o que o Claude lê no CAPTCHA"""
+    try:
+        sess = req.Session()
+        sess.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        r = sess.get(SINCAD_URL, timeout=15)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        form = soup.find('form')
+        inputs = []
+        if form:
+            for inp in form.find_all('input'):
+                inputs.append({
+                    'id': inp.get('id', ''),
+                    'name': inp.get('name', ''),
+                    'type': inp.get('type', ''),
+                    'class': ' '.join(inp.get('class', [])),
+                    'value': inp.get('value', '')[:40]
+                })
+        cap_img = next((i for i in soup.find_all('img')
+            if 'botdetect' in i.get('src', '').lower()
+            or 'get=image' in i.get('src', '').lower()), None)
+        cap_src = None; cap_code = 'sem imagem'
+        if cap_img:
+            cap_src = cap_img['src']
+            if cap_src.startswith('/'): cap_src = SINCAD_BASE + cap_src
+            cap_bytes = sess.get(cap_src, timeout=10).content
+            cap_code = resolver_captcha(cap_bytes)
+        return jsonify({
+            'form_action': form.get('action', '') if form else '',
+            'inputs': inputs,
+            'captcha_src': cap_src,
+            'captcha_lido_pelo_claude': cap_code,
+            'total_inputs': len(inputs)
+        })
+    except Exception as e:
+        return jsonify({'erro': str(e)}), 500
 
 @app.route('/api/consultar', methods=['POST'])
 def api_consultar():
     data = request.get_json() or {}
-    cnpj = data.get('cnpj','').strip()
-    if not cnpj: return jsonify({'erro':'CNPJ não informado'}), 400
-    try:
-        res = consultar_cnpj(cnpj)
-        res['cnpj_fmt'] = fmt_cnpj(cnpj)
-        return jsonify(res)
-    except Exception as e:
-        return jsonify({'condicao':f'Erro: {str(e)[:80]}','ie_encontrada':''}), 200
+    cnpj = data.get('cnpj', '').strip()
+    if not cnpj: return jsonify({'erro': 'CNPJ não informado'}), 400
+    res = consultar_cnpj(cnpj)
+    res['cnpj_fmt'] = fmt_cnpj(cnpj)
+    return jsonify(res)
 
 @app.route('/api/download', methods=['POST'])
 def api_download():
@@ -210,7 +251,6 @@ def api_download():
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         as_attachment=True, download_name=fname)
 
-# ── HTML ────────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -256,8 +296,7 @@ input[type=text]:focus{outline:none;border-color:#472d54}
 .rt tr:last-child td{border-bottom:none}
 .tag{display:inline-block;padding:2px 9px;border-radius:12px;font-size:11px;font-weight:600}
 .tok{background:#e8f5e9;color:#2e7d32}.tbd{background:#fce8e8;color:#b24a4a}
-.twr{background:#fff8e1;color:#f57f17}.tgy{background:#f5f5f5;color:#757575}
-.tpd{background:#e3f2fd;color:#1565c0}
+.twr{background:#fff8e1;color:#f57f17}.tgy{background:#f5f5f5;color:#757575}.tpd{background:#e3f2fd;color:#1565c0}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#303030;color:#fff;padding:10px 20px;border-radius:20px;font-size:13px;z-index:999;opacity:0;transition:opacity .3s;pointer-events:none}
 .info{background:#fef9f0;border-left:3px solid #c17f3e;border-radius:0 8px 8px 0;padding:10px 14px;font-size:12px;color:#7a5c1e;margin-top:14px}
 </style>
@@ -285,9 +324,8 @@ input[type=text]:focus{outline:none;border-color:#472d54}
       <div class="thr"><span class="th">Nome</span><span class="th">CNPJ</span><span class="th">IE</span><span class="th"></span></div>
       <div id="lst"><div class="empty">Adicione empresas ou importe um .xlsx</div></div>
     </div>
-    <div class="info">📋 Formato da planilha: coluna A = Nome &nbsp;|&nbsp; B = CNPJ &nbsp;|&nbsp; C = Inscrição Estadual (opcional)</div>
+    <div class="info">📋 Coluna A = Nome &nbsp;|&nbsp; B = CNPJ &nbsp;|&nbsp; C = Inscrição Estadual (opcional)</div>
   </div>
-
   <div class="card" id="cres" style="display:none">
     <h2>Resultados da consulta</h2>
     <div id="prog"></div>
@@ -296,14 +334,12 @@ input[type=text]:focus{outline:none;border-color:#472d54}
       <button class="btn bs" id="btnst" onclick="stop()">⏹ Parar</button>
     </div>
     <div style="overflow-x:auto">
-      <table class="rt"><thead><tr>
-        <th>Nome</th><th>CNPJ</th><th>Situação</th><th>IE encontrada</th>
-      </tr></thead><tbody id="rbody"></tbody></table>
+      <table class="rt"><thead><tr><th>Nome</th><th>CNPJ</th><th>Situação</th><th>IE encontrada</th></tr></thead>
+      <tbody id="rbody"></tbody></table>
     </div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
-
 <script>
 const K='copiloto-sincad';
 let emps=[],flt_='',run=false,stp=false,res=[];
@@ -325,8 +361,7 @@ function rem(id){emps=emps.filter(e=>e.id!==id);sv();render()}
 function flt(q){flt_=q.toLowerCase();render()}
 function render(){
   const lst=document.getElementById('lst'),bdg=document.getElementById('badge'),btn=document.getElementById('btnc');
-  bdg.textContent=emps.length+' empresa'+(emps.length!==1?'s':'');
-  btn.disabled=emps.length===0||run;
+  bdg.textContent=emps.length+' empresa'+(emps.length!==1?'s':'');btn.disabled=emps.length===0||run;
   const v=flt_?emps.filter(e=>e.nome.toLowerCase().includes(flt_)||e.cnpj.includes(flt_.replace(/\D/g,''))):emps;
   if(!v.length){lst.innerHTML='<div class="empty">'+(emps.length===0?'Nenhuma empresa ainda':'Nenhuma encontrada')+'</div>';return}
   lst.innerHTML=v.map(e=>`<div class="tr"><span class="tn" title="${e.nome}">${e.nome}</span><span class="tm">${fc(e.cnpj)}</span><span class="td">${e.ie||'—'}</span><button class="bd" onclick="rem(${e.id})">×</button></div>`).join('')}
@@ -361,8 +396,7 @@ async function start(){
   window.scrollTo({top:document.getElementById('cres').offsetTop-20,behavior:'smooth'});
   for(let i=0;i<emps.length;i++){
     if(stp)break;
-    const emp=emps[i];
-    let r;
+    const emp=emps[i];let r;
     try{
       const resp=await fetch('/api/consultar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cnpj:emp.cnpj})});
       r=await resp.json();
@@ -370,14 +404,12 @@ async function start(){
     res.push({...emp,...r,cnpj_fmt:fc(emp.cnpj)});
     const tr=document.createElement('tr');
     tr.innerHTML=`<td>${emp.nome}</td><td style="font-family:monospace;font-size:11px">${fc(emp.cnpj)}</td><td>${stag(r.condicao)}</td><td style="font-size:11px;color:#888">${r.ie_encontrada||'—'}</td>`;
-    document.getElementById('rbody').prepend(tr);
-    prog(i+1,emps.length)}
-  run=false;
-  document.getElementById('btnc').disabled=false;
+    document.getElementById('rbody').prepend(tr);prog(i+1,emps.length)}
+  run=false;document.getElementById('btnc').disabled=false;
   document.getElementById('btnst').style.display='none';
   if(res.length)document.getElementById('btndl').style.display='inline-block';
   toast('Consulta finalizada!'+(stp?' (interrompida)':''))}
-function stop(){stp=true;document.getElementById('btnst').style.display='none';toast('Parando após a empresa atual...')}
+function stop(){stp=true;document.getElementById('btnst').style.display='none';toast('Parando...')}
 async function dl(){
   const r=await fetch('/api/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(res)});
   const b=await r.blob(),u=URL.createObjectURL(b),a=document.createElement('a');
