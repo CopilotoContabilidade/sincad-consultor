@@ -41,14 +41,17 @@ def resolver_captcha(img_bytes):
     img_b64 = base64.standard_b64encode(img_bytes).decode('utf-8')
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-sonnet-4-20250514",
         max_tokens=20,
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-            {"type": "text", "text": "Distorted CAPTCHA image. Read the letters and numbers carefully. Reply with ONLY the characters — no spaces, no explanation."}
+            {"type": "text", "text": "This is a CAPTCHA image. Identify all the letters and numbers you see. Reply with ONLY those characters, uppercase, no spaces, no punctuation, no explanation."}
         ]}]
     )
-    return msg.content[0].text.strip()
+    raw = msg.content[0].text.strip()
+    # Keep only alphanumeric characters
+    import re as _re
+    return _re.sub(r'[^A-Z0-9]', '', raw.upper())
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 def limpar_cnpj(v): return ''.join(filter(str.isdigit, str(v)))
@@ -77,14 +80,8 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                 )
                 time.sleep(1)
 
-                # ── Preenche CNPJ com send_keys (dispara eventos corretos) ──
-                cnpj_el = driver.find_element(By.ID, ID_CNPJ)
-                cnpj_el.click()
-                cnpj_el.clear()
-                cnpj_el.send_keys(fmt_cnpj(cnpj))
-                time.sleep(0.3)
-
-                # ── Captura CAPTCHA por screenshot do elemento ──
+                # ── Captura CAPTCHA ANTES de preencher qualquer campo ──
+                # (evita que AJAX no campo CNPJ refresque o CAPTCHA)
                 cap_el = None
                 for xp in [
                     "//img[contains(@src,'get=image')]",
@@ -95,15 +92,25 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                     except: continue
                 if not cap_el:
                     continue
+                time.sleep(1)  # Aguarda imagem do CAPTCHA carregar completamente
 
                 captcha_code = resolver_captcha(cap_el.screenshot_as_png)
+                if not captcha_code:
+                    continue
+
+                # ── Preenche CNPJ (após capturar CAPTCHA) ──
+                cnpj_el = driver.find_element(By.ID, ID_CNPJ)
+                cnpj_el.click()
+                cnpj_el.clear()
+                cnpj_el.send_keys(cnpj)  # Envia só os dígitos (SINCAD aceita ambos)
+                time.sleep(2)  # Aguarda possível AJAX do campo CNPJ
 
                 # ── Preenche CAPTCHA com send_keys (ID direto) ──
                 cap_input = driver.find_element(By.ID, ID_CAPTCHA)
                 cap_input.click()
                 cap_input.clear()
                 cap_input.send_keys(captcha_code)
-                time.sleep(0.3)
+                time.sleep(0.5)
 
                 # ── Clica em Pesquisar (ID direto) ──
                 driver.find_element(By.ID, ID_BTN).click()
@@ -233,6 +240,67 @@ def api_screenshot():
             cap_info = {'erro': str(e)}
 
         return jsonify({'campos': campos, 'captcha': cap_info, 'pagina': page_b64})
+    except Exception as e:
+        return jsonify({'erro': str(e)}), 500
+    finally:
+        if driver:
+            try: driver.quit()
+            except: pass
+
+
+@app.route('/api/debug')
+def api_debug():
+    """Debug: preenche formulário, screenshot antes do submit, submete, retorna tudo"""
+    cnpj_raw = request.args.get('cnpj', '25316180000146')
+    cnpj = limpar_cnpj(cnpj_raw)
+    driver = None
+    try:
+        driver = criar_driver()
+        driver.get(SINCAD_URL)
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.ID, 'formulario:txtCNPJ'))
+        )
+
+        # Captura CAPTCHA ANTES de preencher campos
+        cap_el = driver.find_element(By.XPATH, "//img[contains(@src,'get=image') or contains(@src,'botdetect')]")
+        time.sleep(1)
+        cap_b64 = base64.standard_b64encode(cap_el.screenshot_as_png).decode()
+        captcha_code = resolver_captcha(cap_el.screenshot_as_png)
+
+        # Preenche CNPJ
+        cnpj_el = driver.find_element(By.ID, 'formulario:txtCNPJ')
+        cnpj_el.click(); cnpj_el.clear(); cnpj_el.send_keys(cnpj)
+        time.sleep(2)
+
+        # Preenche CAPTCHA
+        cap_inp = driver.find_element(By.ID, 'formulario:captchaText')
+        cap_inp.click(); cap_inp.clear(); cap_inp.send_keys(captcha_code)
+        time.sleep(0.5)
+
+        # Screenshot ANTES do submit (para ver campos preenchidos)
+        before_b64 = base64.standard_b64encode(driver.get_screenshot_as_png()).decode()
+
+        # Verifica o que está realmente nos campos
+        cnpj_val  = driver.find_element(By.ID, 'formulario:txtCNPJ').get_attribute('value')
+        cap_val   = driver.find_element(By.ID, 'formulario:captchaText').get_attribute('value')
+
+        # Submete
+        driver.find_element(By.ID, 'formulario:btnPesquisar').click()
+        time.sleep(5)
+
+        body = driver.find_element(By.TAG_NAME, 'body').text[:500]
+        after_b64 = base64.standard_b64encode(driver.get_screenshot_as_png()).decode()
+
+        return jsonify({
+            'captcha_lido': captcha_code,
+            'cnpj_digitado': cnpj,
+            'cnpj_no_campo': cnpj_val,
+            'captcha_no_campo': cap_val,
+            'resultado_body': body,
+            'captcha_img': cap_b64,
+            'before_submit': before_b64,
+            'after_submit': after_b64
+        })
     except Exception as e:
         return jsonify({'erro': str(e)}), 500
     finally:
