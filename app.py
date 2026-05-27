@@ -38,19 +38,14 @@ def resolver_captcha(img_bytes):
     api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip().strip('"\'')
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY nao configurada no ambiente")
-    img = Image.open(io.BytesIO(img_bytes)).convert('L')
-    img = ImageEnhance.Contrast(img).enhance(2.5)
-    img = ImageEnhance.Sharpness(img).enhance(2.0)
-    img = img.convert('RGB')
-    buf = io.BytesIO(); img.save(buf, format='PNG')
-    img_b64 = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
+    img_b64 = base64.standard_b64encode(img_bytes).decode('utf-8')
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=20,
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-            {"type": "text", "text": "CAPTCHA image. Reply ONLY with the characters you see, nothing else."}
+            {"type": "text", "text": "Distorted CAPTCHA image. Read the letters and numbers carefully. Reply with ONLY the characters — no spaces, no explanation."}
         ]}]
     )
     return msg.content[0].text.strip()
@@ -107,11 +102,8 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                 if not cap_el:
                     continue
 
-                cap_src = cap_el.get_attribute('src')
-                if cap_src.startswith('/'): cap_src = SINCAD_BASE + cap_src
-                cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                cap_r = req.get(cap_src, cookies=cookies, timeout=10)
-                captcha_code = resolver_captcha(cap_r.content)
+                # Screenshot direto do elemento — mais confiável que download HTTP
+                captcha_code = resolver_captcha(cap_el.screenshot_as_png)
 
                 # ── Preenche CAPTCHA via JavaScript (último input visível) ──
                 driver.execute_script("""
@@ -144,6 +136,8 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                     continue
 
                 if 'não há registros' in body or 'nenhum registro' in body:
+                    if t < max_tent:
+                        continue  # Pode ser CAPTCHA errado — tenta de novo
                     return {'condicao': 'Sem registros', 'ie_encontrada': ''}
 
                 soup = BeautifulSoup(driver.page_source, 'html.parser')
@@ -157,7 +151,8 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                         elif len(cells) >= 2 and cells[-1]: conds.append(cells[-1])
                 if conds:
                     return {'condicao': ' | '.join(filter(None, conds)),
-                            'ie_encontrada': ' | '.join(filter(None, ies))}
+                            'ie_encontrada': ' | '.join(filter(None, ies)),
+                            'captcha_usado': captcha_code}
                 if t == max_tent:
                     return {'condicao': 'Resultado não reconhecido', 'ie_encontrada': ''}
 
