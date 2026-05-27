@@ -61,27 +61,6 @@ def fmt_cnpj(v):
     c = limpar_cnpj(v).zfill(14)
     return f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}"
 
-def preencher(driver, el, valor):
-    try:
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block:'center'});"
-            "arguments[0].removeAttribute('readonly');"
-            "arguments[0].removeAttribute('disabled');", el)
-        time.sleep(0.2)
-        el.click(); time.sleep(0.1)
-        el.clear(); el.send_keys(valor)
-        return True
-    except: pass
-    try:
-        driver.execute_script(
-            "var e=arguments[0],v=arguments[1];"
-            "e.removeAttribute('readonly');e.removeAttribute('disabled');"
-            "e.value=v;"
-            "['input','change'].forEach(t=>e.dispatchEvent(new Event(t,{bubbles:true})));",
-            el, valor)
-        return True
-    except: return False
-
 # ── Consulta ───────────────────────────────────────────────────────────────
 def consultar_cnpj(cnpj_raw, max_tent=4):
     cnpj = limpar_cnpj(cnpj_raw)
@@ -95,23 +74,24 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                 driver.get(SINCAD_URL)
                 time.sleep(3)  # Aguarda JS renderizar o formulário
 
-                # ── Campo CNPJ ──
-                campo_cnpj = None
-                for xp in [
-                    "//input[contains(translate(@id,'CNPJ','cnpj'),'cnpj')]",
-                    "//input[contains(translate(@name,'CNPJ','cnpj'),'cnpj')]",
-                    "(//input[@type='text'])[1]",
-                    "(//input[not(@type='hidden')])[1]",
-                ]:
-                    try:
-                        campo_cnpj = wait.until(EC.presence_of_element_located((By.XPATH, xp)))
-                        break
-                    except: continue
+                # Aguarda pelo menos um input de texto visível
+                try:
+                    wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='text' or not(@type)]")))
+                except: pass
+                time.sleep(1)
 
-                if not campo_cnpj:
-                    continue
-
-                preencher(driver, campo_cnpj, fmt_cnpj(cnpj))
+                # ── Preenche CNPJ via JavaScript (ignora proteções do campo) ──
+                driver.execute_script("""
+                    var inputs = Array.from(document.querySelectorAll('input'));
+                    var vis = inputs.filter(i => (i.type==='' || i.type==='text') && i.offsetParent!==null);
+                    if (vis.length > 0) {
+                        var f = vis[0];
+                        f.removeAttribute('readonly'); f.removeAttribute('disabled');
+                        f.value = arguments[0];
+                        f.dispatchEvent(new Event('input',  {bubbles:true}));
+                        f.dispatchEvent(new Event('change', {bubbles:true}));
+                    }
+                """, fmt_cnpj(cnpj))
                 time.sleep(0.5)
 
                 # ── CAPTCHA imagem ──
@@ -133,40 +113,27 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                 cap_r = req.get(cap_src, cookies=cookies, timeout=10)
                 captcha_code = resolver_captcha(cap_r.content)
 
-                # ── Campo CAPTCHA ──
-                campo_cap = None
-                for xp in [
-                    "//input[contains(@class,'BDC_CaptchaInput')]",
-                    "//input[contains(@id,'BDC') or contains(@name,'BDC')]",
-                    "//input[contains(translate(@id,'CAPTCHA','captcha'),'captcha') and not(contains(translate(@id,'CNPJ','cnpj'),'cnpj'))]",
-                    "//input[contains(translate(@name,'CAPTCHA','captcha'),'captcha')]",
-                    "(//input[@type='text'])[last()]",
-                    "(//input[not(@type='hidden')])[last()]",
-                ]:
-                    try:
-                        el = driver.find_element(By.XPATH, xp)
-                        if el != campo_cnpj: campo_cap = el; break
-                    except: continue
+                # ── Preenche CAPTCHA via JavaScript (último input visível) ──
+                driver.execute_script("""
+                    var inputs = Array.from(document.querySelectorAll('input'));
+                    var vis = inputs.filter(i => (i.type==='' || i.type==='text') && i.offsetParent!==null);
+                    if (vis.length > 1) {
+                        var last = vis[vis.length - 1];
+                        last.removeAttribute('readonly'); last.removeAttribute('disabled');
+                        last.focus();
+                        last.value = arguments[0];
+                        last.dispatchEvent(new Event('input',  {bubbles:true}));
+                        last.dispatchEvent(new Event('change', {bubbles:true}));
+                        last.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true}));
+                    }
+                """, captcha_code)
+                time.sleep(0.5)
 
-                if not campo_cap:
-                    continue
-
-                preencher(driver, campo_cap, captcha_code)
-                time.sleep(0.3)
-
-                # ── Submit ──
-                btn = None
-                for xp in [
-                    "//input[@type='submit']",
-                    "//button[@type='submit']",
-                    "//button[contains(normalize-space(),'Pesquis')]",
-                    "//input[contains(@value,'Pesquis')]",
-                ]:
-                    try: btn = driver.find_element(By.XPATH, xp); break
-                    except: continue
-
-                if not btn: continue
-                btn.click()
+                # ── Submit via JavaScript ──
+                driver.execute_script("""
+                    var btn = document.querySelector('input[type="submit"], button[type="submit"]');
+                    if (btn) btn.click();
+                """)
                 time.sleep(4)
 
                 # ── Resultado ──
