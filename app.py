@@ -62,73 +62,54 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
     driver = None
     try:
         driver = criar_driver()
-        wait = WebDriverWait(driver, 15)
+        # IDs reais confirmados via /api/screenshot
+        ID_CNPJ    = "formulario:txtCNPJ"
+        ID_CAPTCHA = "formulario:captchaText"
+        ID_BTN     = "formulario:btnPesquisar"
 
         for t in range(1, max_tent + 1):
             try:
                 driver.get(SINCAD_URL)
-                time.sleep(3)  # Aguarda JS renderizar o formulário
 
-                # Aguarda pelo menos um input de texto visível
-                try:
-                    wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='text' or not(@type)]")))
-                except: pass
+                # Aguarda campo CNPJ ficar presente (JS renderizou)
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.ID, ID_CNPJ))
+                )
                 time.sleep(1)
 
-                # ── Preenche CNPJ via JavaScript (ignora proteções do campo) ──
-                driver.execute_script("""
-                    var inputs = Array.from(document.querySelectorAll('input'));
-                    var vis = inputs.filter(i => (i.type==='' || i.type==='text') && i.offsetParent!==null);
-                    if (vis.length > 0) {
-                        var f = vis[0];
-                        f.removeAttribute('readonly'); f.removeAttribute('disabled');
-                        f.value = arguments[0];
-                        f.dispatchEvent(new Event('input',  {bubbles:true}));
-                        f.dispatchEvent(new Event('change', {bubbles:true}));
-                    }
-                """, fmt_cnpj(cnpj))
-                time.sleep(0.5)
+                # ── Preenche CNPJ com send_keys (dispara eventos corretos) ──
+                cnpj_el = driver.find_element(By.ID, ID_CNPJ)
+                cnpj_el.click()
+                cnpj_el.clear()
+                cnpj_el.send_keys(fmt_cnpj(cnpj))
+                time.sleep(0.3)
 
-                # ── CAPTCHA imagem ──
+                # ── Captura CAPTCHA por screenshot do elemento ──
                 cap_el = None
                 for xp in [
-                    "//img[contains(@src,'botdetect')]",
                     "//img[contains(@src,'get=image')]",
+                    "//img[contains(@src,'botdetect')]",
                     "//img[contains(@src,'captcha') or contains(@src,'Captcha')]",
                 ]:
                     try: cap_el = driver.find_element(By.XPATH, xp); break
                     except: continue
-
                 if not cap_el:
                     continue
 
-                # Screenshot direto do elemento — mais confiável que download HTTP
                 captcha_code = resolver_captcha(cap_el.screenshot_as_png)
 
-                # ── Preenche CAPTCHA via JavaScript (último input visível) ──
-                driver.execute_script("""
-                    var inputs = Array.from(document.querySelectorAll('input'));
-                    var vis = inputs.filter(i => (i.type==='' || i.type==='text') && i.offsetParent!==null);
-                    if (vis.length > 1) {
-                        var last = vis[vis.length - 1];
-                        last.removeAttribute('readonly'); last.removeAttribute('disabled');
-                        last.focus();
-                        last.value = arguments[0];
-                        last.dispatchEvent(new Event('input',  {bubbles:true}));
-                        last.dispatchEvent(new Event('change', {bubbles:true}));
-                        last.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true}));
-                    }
-                """, captcha_code)
-                time.sleep(0.5)
+                # ── Preenche CAPTCHA com send_keys (ID direto) ──
+                cap_input = driver.find_element(By.ID, ID_CAPTCHA)
+                cap_input.click()
+                cap_input.clear()
+                cap_input.send_keys(captcha_code)
+                time.sleep(0.3)
 
-                # ── Submit via JavaScript ──
-                driver.execute_script("""
-                    var btn = document.querySelector('input[type="submit"], button[type="submit"]');
-                    if (btn) btn.click();
-                """)
-                time.sleep(4)
+                # ── Clica em Pesquisar (ID direto) ──
+                driver.find_element(By.ID, ID_BTN).click()
+                time.sleep(5)
 
-                # ── Resultado ──
+                # ── Analisa resultado ──
                 body = driver.find_element(By.TAG_NAME, 'body').text.lower()
                 erros_cap = ['captcha inválido', 'código inválido', 'invalid captcha',
                              'captcha incorreto', 'tente novamente', 'informe o código']
@@ -138,7 +119,7 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                 if 'não há registros' in body or 'nenhum registro' in body:
                     if t < max_tent:
                         continue  # Pode ser CAPTCHA errado — tenta de novo
-                    return {'condicao': 'Sem registros', 'ie_encontrada': ''}
+                    return {'condicao': 'Sem registros', 'ie_encontrada': '', 'tentativas': t}
 
                 soup = BeautifulSoup(driver.page_source, 'html.parser')
                 conds, ies = [], []
@@ -152,13 +133,13 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                 if conds:
                     return {'condicao': ' | '.join(filter(None, conds)),
                             'ie_encontrada': ' | '.join(filter(None, ies)),
-                            'captcha_usado': captcha_code}
+                            'captcha_usado': captcha_code, 'tentativas': t}
                 if t == max_tent:
-                    return {'condicao': 'Resultado não reconhecido', 'ie_encontrada': ''}
+                    return {'condicao': 'Resultado não reconhecido', 'ie_encontrada': '', 'tentativas': t}
 
             except Exception as e:
                 if t == max_tent:
-                    return {'condicao': f'Erro: {str(e)[:80]}', 'ie_encontrada': ''}
+                    return {'condicao': f'Erro: {str(e)[:80]}', 'ie_encontrada': '', 'tentativas': t}
                 time.sleep(1)
 
     finally:
