@@ -11,25 +11,27 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 app = Flask(__name__)
 
-SINCAD_URL        = "https://sucief-sincad-web.fazenda.rj.gov.br/sincad-web/index.jsf"
-SINCAD_BASE       = "https://sucief-sincad-web.fazenda.rj.gov.br"
-BROWSERLESS_TOKEN = os.environ.get('BROWSERLESS_TOKEN', '')
+SINCAD_URL  = "https://sucief-sincad-web.fazenda.rj.gov.br/sincad-web/index.jsf"
+SINCAD_BASE = "https://sucief-sincad-web.fazenda.rj.gov.br"
 
-# ── Selenium remoto (Browserless) ──────────────────────────────────────────
+# ── Driver local com Chrome headless ──────────────────────────────────────
 def criar_driver():
-    opts = webdriver.ChromeOptions()
+    opts = Options()
+    opts.add_argument('--headless=new')
     opts.add_argument('--no-sandbox')
     opts.add_argument('--disable-dev-shm-usage')
     opts.add_argument('--disable-gpu')
-    driver = webdriver.Remote(
-        command_executor=f'https://production-sfo.browserless.io/webdriver?token={BROWSERLESS_TOKEN}',
-        options=opts
-    )
-    driver.set_page_load_timeout(25)
-    return driver
+    opts.add_argument('--window-size=1366,768')
+    opts.add_argument('--disable-blink-features=AutomationControlled')
+    opts.add_experimental_option('excludeSwitches', ['enable-automation'])
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=opts)
 
 # ── CAPTCHA via Claude Vision ──────────────────────────────────────────────
 def resolver_captcha(img_bytes):
@@ -45,7 +47,7 @@ def resolver_captcha(img_bytes):
         max_tokens=20,
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-            {"type": "text",  "text": "CAPTCHA image. Reply ONLY with the characters you see, no spaces or explanation."}
+            {"type": "text", "text": "CAPTCHA image. Reply ONLY with the characters you see, nothing else."}
         ]}]
     )
     return msg.content[0].text.strip()
@@ -57,18 +59,27 @@ def fmt_cnpj(v):
     return f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}"
 
 def preencher(driver, el, valor):
-    """Preenche campo com múltiplos fallbacks"""
     try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].removeAttribute('readonly'); arguments[0].removeAttribute('disabled');", el)
-        time.sleep(0.2); el.click(); time.sleep(0.1)
-        el.clear(); el.send_keys(valor); return True
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});"
+            "arguments[0].removeAttribute('readonly');"
+            "arguments[0].removeAttribute('disabled');", el)
+        time.sleep(0.2)
+        el.click(); time.sleep(0.1)
+        el.clear(); el.send_keys(valor)
+        return True
     except: pass
     try:
-        driver.execute_script("var e=arguments[0]; e.removeAttribute('readonly'); e.removeAttribute('disabled'); e.value=arguments[1]; ['input','change'].forEach(t=>e.dispatchEvent(new Event(t,{bubbles:true})));", el, valor)
+        driver.execute_script(
+            "var e=arguments[0],v=arguments[1];"
+            "e.removeAttribute('readonly');e.removeAttribute('disabled');"
+            "e.value=v;"
+            "['input','change'].forEach(t=>e.dispatchEvent(new Event(t,{bubbles:true})));",
+            el, valor)
         return True
     except: return False
 
-# ── Consulta principal ─────────────────────────────────────────────────────
+# ── Consulta ───────────────────────────────────────────────────────────────
 def consultar_cnpj(cnpj_raw, max_tent=4):
     cnpj = limpar_cnpj(cnpj_raw)
     driver = None
@@ -79,7 +90,7 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
         for t in range(1, max_tent + 1):
             try:
                 driver.get(SINCAD_URL)
-                time.sleep(3)  # Aguarda JavaScript renderizar
+                time.sleep(3)  # Aguarda JS renderizar o formulário
 
                 # ── Campo CNPJ ──
                 campo_cnpj = None
@@ -89,10 +100,14 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                     "(//input[@type='text'])[1]",
                     "(//input[not(@type='hidden')])[1]",
                 ]:
-                    try: campo_cnpj = wait.until(EC.presence_of_element_located((By.XPATH, xp))); break
+                    try:
+                        campo_cnpj = wait.until(EC.presence_of_element_located((By.XPATH, xp)))
+                        break
                     except: continue
+
                 if not campo_cnpj:
                     continue
+
                 preencher(driver, campo_cnpj, fmt_cnpj(cnpj))
                 time.sleep(0.5)
 
@@ -105,6 +120,7 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                 ]:
                     try: cap_el = driver.find_element(By.XPATH, xp); break
                     except: continue
+
                 if not cap_el:
                     continue
 
@@ -118,9 +134,9 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                 campo_cap = None
                 for xp in [
                     "//input[contains(@class,'BDC_CaptchaInput')]",
+                    "//input[contains(@id,'BDC') or contains(@name,'BDC')]",
                     "//input[contains(translate(@id,'CAPTCHA','captcha'),'captcha') and not(contains(translate(@id,'CNPJ','cnpj'),'cnpj'))]",
                     "//input[contains(translate(@name,'CAPTCHA','captcha'),'captcha')]",
-                    "//input[contains(@id,'BDC') or contains(@name,'BDC')]",
                     "(//input[@type='text'])[last()]",
                     "(//input[not(@type='hidden')])[last()]",
                 ]:
@@ -128,26 +144,35 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                         el = driver.find_element(By.XPATH, xp)
                         if el != campo_cnpj: campo_cap = el; break
                     except: continue
+
                 if not campo_cap:
                     continue
+
                 preencher(driver, campo_cap, captcha_code)
                 time.sleep(0.3)
 
                 # ── Submit ──
                 btn = None
-                for xp in ["//input[@type='submit']", "//button[@type='submit']",
-                           "//button[contains(normalize-space(),'Pesquis')]",
-                           "//input[contains(@value,'Pesquis')]"]:
+                for xp in [
+                    "//input[@type='submit']",
+                    "//button[@type='submit']",
+                    "//button[contains(normalize-space(),'Pesquis')]",
+                    "//input[contains(@value,'Pesquis')]",
+                ]:
                     try: btn = driver.find_element(By.XPATH, xp); break
                     except: continue
+
                 if not btn: continue
                 btn.click()
                 time.sleep(4)
 
                 # ── Resultado ──
                 body = driver.find_element(By.TAG_NAME, 'body').text.lower()
-                erros_cap = ['captcha inválido','código inválido','invalid captcha','captcha incorreto','tente novamente']
-                if any(x in body for x in erros_cap): continue
+                erros_cap = ['captcha inválido', 'código inválido', 'invalid captcha',
+                             'captcha incorreto', 'tente novamente', 'informe o código']
+                if any(x in body for x in erros_cap):
+                    continue
+
                 if 'não há registros' in body or 'nenhum registro' in body:
                     return {'condicao': 'Sem registros', 'ie_encontrada': ''}
 
@@ -165,40 +190,45 @@ def consultar_cnpj(cnpj_raw, max_tent=4):
                             'ie_encontrada': ' | '.join(filter(None, ies))}
                 if t == max_tent:
                     return {'condicao': 'Resultado não reconhecido', 'ie_encontrada': ''}
+
             except Exception as e:
                 if t == max_tent:
                     return {'condicao': f'Erro: {str(e)[:80]}', 'ie_encontrada': ''}
                 time.sleep(1)
+
     finally:
         if driver:
             try: driver.quit()
             except: pass
+
     return {'condicao': 'Falha', 'ie_encontrada': ''}
 
 # ── Excel ──────────────────────────────────────────────────────────────────
 def gerar_excel(empresas):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "SINCAD"
     headers = ['Nome','CNPJ','IE (entrada)','IE (SINCAD)','Situação','Consultado em']
-    widths  = [45,22,22,22,38,22]
-    hf=PatternFill("solid",fgColor="472D54"); ht=Font(bold=True,color="FFFFFF")
-    for col,(h,w) in enumerate(zip(headers,widths),1):
-        c=ws.cell(row=1,column=col,value=h); c.fill=hf; c.font=ht
-        c.alignment=Alignment(horizontal='center')
-        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width=w
-    ws.row_dimensions[1].height=22
+    widths  = [45, 22, 22, 22, 38, 22]
+    hf = PatternFill("solid", fgColor="472D54"); ht = Font(bold=True, color="FFFFFF")
+    for col, (h, w) in enumerate(zip(headers, widths), 1):
+        c = ws.cell(row=1, column=col, value=h)
+        c.fill=hf; c.font=ht; c.alignment=Alignment(horizontal='center')
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = w
+    ws.row_dimensions[1].height = 22
     CV=PatternFill("solid",fgColor="C6EFCE"); CR=PatternFill("solid",fgColor="FFC7CE")
     CA=PatternFill("solid",fgColor="FFEB9C"); CC=PatternFill("solid",fgColor="EEEEEE")
-    now=datetime.now().strftime('%d/%m/%Y %H:%M')
-    for i,e in enumerate(empresas,2):
-        cl=e.get('condicao','').lower()
+    now = datetime.now().strftime('%d/%m/%Y %H:%M')
+    for i, e in enumerate(empresas, 2):
+        cl = e.get('condicao','').lower()
         if any(p in cl for p in ['habilitad','ativa','regular']): fill=CV
         elif any(p in cl for p in ['baix','cancel','inapt','irregular']): fill=CR
         elif any(p in cl for p in ['suspens','sem registro']): fill=CA
         else: fill=CC
-        vals=[e.get('nome',''),fmt_cnpj(e.get('cnpj','')),e.get('ie',''),e.get('ie_encontrada',''),e.get('condicao',''),now]
-        for col,val in enumerate(vals,1): ws.cell(row=i,column=col,value=val).fill=fill
-    ws.freeze_panes='A2'
-    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+        vals = [e.get('nome',''), fmt_cnpj(e.get('cnpj','')),
+                e.get('ie',''), e.get('ie_encontrada',''), e.get('condicao',''), now]
+        for col, val in enumerate(vals, 1):
+            ws.cell(row=i, column=col, value=val).fill = fill
+    ws.freeze_panes = 'A2'
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf
 
 # ── Rotas ──────────────────────────────────────────────────────────────────
@@ -207,20 +237,21 @@ def index(): return HTML
 
 @app.route('/api/consultar', methods=['POST'])
 def api_consultar():
-    data=request.get_json() or {}
-    cnpj=data.get('cnpj','').strip()
-    if not cnpj: return jsonify({'erro':'CNPJ não informado'}),400
-    res=consultar_cnpj(cnpj)
-    res['cnpj_fmt']=fmt_cnpj(cnpj)
+    data = request.get_json() or {}
+    cnpj = data.get('cnpj','').strip()
+    if not cnpj: return jsonify({'erro':'CNPJ não informado'}), 400
+    res = consultar_cnpj(cnpj)
+    res['cnpj_fmt'] = fmt_cnpj(cnpj)
     return jsonify(res)
 
 @app.route('/api/download', methods=['POST'])
 def api_download():
-    empresas=request.get_json() or []
-    buf=gerar_excel(empresas)
-    fname=f"resultado_sincad_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-    return send_file(buf,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                     as_attachment=True,download_name=fname)
+    empresas = request.get_json() or []
+    buf = gerar_excel(empresas)
+    fname = f"resultado_sincad_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    return send_file(buf,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True, download_name=fname)
 
 HTML = r"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -354,7 +385,7 @@ function stag(c){const cl=(c||'').toLowerCase();
   if(cl.includes('suspens')||cl.includes('sem registro'))return`<span class="tag twr">${c}</span>`;
   if(cl.includes('erro')||cl.includes('falha'))return`<span class="tag tgy">${c}</span>`;
   return`<span class="tag tpd">${c||'Aguardando'}</span>`}
-function prog(f,t){document.getElementById('prog').innerHTML=`<div class="pb"><div class="pf" style="width:${Math.round(f/t*100)}%"></div></div><div class="pt">${f} de ${t} — cada empresa leva ~20 segundos</div>`}
+function prog(f,t){document.getElementById('prog').innerHTML=`<div class="pb"><div class="pf" style="width:${Math.round(f/t*100)}%"></div></div><div class="pt">${f} de ${t} — cada empresa leva ~30 segundos</div>`}
 async function start(){
   if(!emps.length)return;run=true;stp=false;res=[];
   document.getElementById('cres').style.display='block';
