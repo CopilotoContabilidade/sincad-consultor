@@ -218,6 +218,47 @@ def api_download():
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         as_attachment=True, download_name=fname)
 
+
+@app.route('/api/screenshot')
+def api_screenshot():
+    """Diagnóstico: abre o SINCAD, tira screenshot e mostra campos"""
+    driver = None
+    try:
+        driver = criar_driver()
+        driver.get(SINCAD_URL)
+        time.sleep(4)
+
+        # Screenshot da página inteira
+        page_b64 = base64.standard_b64encode(driver.get_screenshot_as_png()).decode()
+
+        # Campos visíveis
+        campos = driver.execute_script("""
+            var inputs = Array.from(document.querySelectorAll('input'));
+            return inputs.map(i => ({
+                id: i.id, name: i.name, type: i.type,
+                visible: i.offsetParent !== null,
+                cls: i.className, value: i.value
+            }));
+        """)
+
+        # CAPTCHA
+        cap_info = {}
+        try:
+            cap_el = driver.find_element('xpath', "//img[contains(@src,'botdetect') or contains(@src,'get=image')]")
+            cap_b64 = base64.standard_b64encode(cap_el.screenshot_as_png).decode()
+            cap_code = resolver_captcha(cap_el.screenshot_as_png)
+            cap_info = {'src': cap_el.get_attribute('src'), 'captcha_lido': cap_code, 'imagem': cap_b64}
+        except Exception as e:
+            cap_info = {'erro': str(e)}
+
+        return jsonify({'campos': campos, 'captcha': cap_info, 'pagina': page_b64})
+    except Exception as e:
+        return jsonify({'erro': str(e)}), 500
+    finally:
+        if driver:
+            try: driver.quit()
+            except: pass
+
 HTML = r"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
