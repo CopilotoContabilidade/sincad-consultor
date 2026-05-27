@@ -35,13 +35,16 @@ def criar_driver():
 
 # ── CAPTCHA via Claude Vision ──────────────────────────────────────────────
 def resolver_captcha(img_bytes):
+    api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip().strip('"\'')
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY nao configurada no ambiente")
     img = Image.open(io.BytesIO(img_bytes)).convert('L')
     img = ImageEnhance.Contrast(img).enhance(2.5)
     img = ImageEnhance.Sharpness(img).enhance(2.0)
     img = img.convert('RGB')
     buf = io.BytesIO(); img.save(buf, format='PNG')
     img_b64 = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=20,
