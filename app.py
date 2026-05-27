@@ -41,7 +41,7 @@ def resolver_captcha(img_bytes):
     img_b64 = base64.standard_b64encode(img_bytes).decode('utf-8')
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=20,
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
